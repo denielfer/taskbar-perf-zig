@@ -5,6 +5,9 @@ const hardware = @import("hardware.zig");
 const interfaces = @import("network.zig");
 
 pub const capacity = 60;
+/// Worker threads: Zig's spawn commits the full stack on Windows, so the 16 MiB default
+/// is 16 MiB of private memory per thread. 512 KiB leaves room for COM/UIA calls.
+pub const thread_stack_size = 512 * 1024;
 pub const Kind = enum { cpu, ram, gpu, disk, network };
 
 pub const Series = struct {
@@ -120,7 +123,8 @@ pub const Sampler = struct {
     pub fn start(self: *Sampler, notify_window: w.HWND, notify_message: w.UINT) !void {
         self.notify_window = notify_window;
         self.notify_message = notify_message;
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        // std.Thread.spawn on Windows commits the whole stack (16 MiB by default): keep it small.
+        self.thread = try std.Thread.spawn(.{ .stack_size = thread_stack_size }, run, .{self});
     }
 
     pub fn deinit(self: *Sampler) void {
@@ -245,8 +249,18 @@ pub const Collector = struct {
     query: w.PDH_HQUERY = null,
     disk: w.PDH_HCOUNTER = null,
     gpu: w.PDH_HCOUNTER = null,
+    // CPU speed is only shown in the summary panel: its counters live in their own query,
+    // collected only while the panel is open (collecting them every second is not free).
+    cpu_query: w.PDH_HQUERY = null,
     cpu_frequency: w.PDH_HCOUNTER = null,
     cpu_performance: w.PDH_HCOUNTER = null,
+    cpu_query_warm: bool = false,
+    cpu_query_retry: u32 = 0,
+    // Network: the interface list is rebuilt only when Windows reports a change (or every
+    // ~60 samples); each sample reads just the listed interfaces with GetIfEntry2.
+    net_dirty: std.atomic.Value(bool) = .init(true),
+    net_watch: [2]?*anyopaque = .{ null, null },
+    net_list_age: u32 = 0,
     cpu: ?CpuTimes = null,
     cpu_ghz: ?f64 = null,
     memory: ?Memory = null,
@@ -262,16 +276,20 @@ pub const Collector = struct {
     pdh_retry_countdown: u32 = 30,
     pdh_retry_interval: u32 = 30,
 
+    /// `self` must not move afterwards: the network change callbacks hold `&self.net_dirty`.
     pub fn init(self: *Collector) void {
         self.cpu = cpuTimes();
         self.temperature_reader = hardware.TemperatureReader.load();
         self.refreshGpus();
+        interfaces.watchChanges(&self.net_dirty, &self.net_watch);
         _ = self.readNetworks(false);
         self.openPdh();
     }
 
     pub fn deinit(self: *Collector) void {
+        interfaces.unwatchChanges(&self.net_watch);
         self.closePdh();
+        self.closeCpuQuery();
         if (self.graphics) |factory| _ = factory.lpVtbl.*.Release.?(factory);
         self.disks.deinit(allocator);
         self.networks.deinit(allocator);
@@ -286,10 +304,8 @@ pub const Collector = struct {
             self.query = null;
             return;
         }
-        self.disk = self.addCounter(win.wide("\\PhysicalDisk(*)\\% Idle Time"));
-        self.gpu = self.addCounter(win.wide("\\GPU Engine(*)\\Utilization Percentage"));
-        self.cpu_frequency = self.addCounter(win.wide("\\Processor Information(_Total)\\Processor Frequency"));
-        self.cpu_performance = self.addCounter(win.wide("\\Processor Information(_Total)\\% Processor Performance"));
+        self.disk = self.addCounter(self.query, win.wide("\\PhysicalDisk(*)\\% Idle Time"));
+        self.gpu = self.addCounter(self.query, win.wide("\\GPU Engine(*)\\Utilization Percentage"));
         _ = w.PdhCollectQueryData(self.query);
         self.pdh_samples = 0;
     }
@@ -301,13 +317,10 @@ pub const Collector = struct {
         }
         self.disk = null;
         self.gpu = null;
-        self.cpu_frequency = null;
-        self.cpu_performance = null;
     }
 
     fn pdhMissingCounters(self: *const Collector) bool {
-        return self.query == null or self.disk == null or self.gpu == null or
-            self.cpu_frequency == null or self.cpu_performance == null;
+        return self.query == null or self.disk == null or self.gpu == null;
     }
 
     fn retryMissingPdhCounters(self: *Collector) bool {
@@ -315,11 +328,60 @@ pub const Collector = struct {
             self.openPdh();
             return true;
         }
-        if (self.disk == null) self.disk = self.addCounter(win.wide("\\PhysicalDisk(*)\\% Idle Time"));
-        if (self.gpu == null) self.gpu = self.addCounter(win.wide("\\GPU Engine(*)\\Utilization Percentage"));
-        if (self.cpu_frequency == null) self.cpu_frequency = self.addCounter(win.wide("\\Processor Information(_Total)\\Processor Frequency"));
-        if (self.cpu_performance == null) self.cpu_performance = self.addCounter(win.wide("\\Processor Information(_Total)\\% Processor Performance"));
+        if (self.disk == null) self.disk = self.addCounter(self.query, win.wide("\\PhysicalDisk(*)\\% Idle Time"));
+        if (self.gpu == null) self.gpu = self.addCounter(self.query, win.wide("\\GPU Engine(*)\\Utilization Percentage"));
         return false;
+    }
+
+    /// Opens the CPU speed query on first use; retried at most every 60 samples if it fails.
+    fn ensureCpuQuery(self: *Collector) bool {
+        if (self.cpu_query != null and self.cpu_frequency != null) return true;
+        if (self.cpu_query_retry > 0) {
+            self.cpu_query_retry -= 1;
+            return false;
+        }
+        self.closeCpuQuery();
+        if (w.PdhOpenQueryW(null, 0, &self.cpu_query) != 0) {
+            self.cpu_query = null;
+            self.cpu_query_retry = 60;
+            return false;
+        }
+        self.cpu_frequency = self.addCounter(self.cpu_query, win.wide("\\Processor Information(_Total)\\Processor Frequency"));
+        self.cpu_performance = self.addCounter(self.cpu_query, win.wide("\\Processor Information(_Total)\\% Processor Performance"));
+        if (self.cpu_frequency == null) {
+            self.closeCpuQuery();
+            self.cpu_query_retry = 60;
+            return false;
+        }
+        return true;
+    }
+
+    fn closeCpuQuery(self: *Collector) void {
+        if (self.cpu_query != null) {
+            _ = w.PdhCloseQuery(self.cpu_query);
+            self.cpu_query = null;
+        }
+        self.cpu_frequency = null;
+        self.cpu_performance = null;
+        self.cpu_query_warm = false;
+    }
+
+    /// CPU speed for the summary panel. The first collection after the panel opens only sets
+    /// a baseline: % Processor Performance is a rate and would average the closed period.
+    fn sampleCpuSpeed(self: *Collector, summary_open: bool) ?f64 {
+        if (!summary_open or !self.ensureCpuQuery()) {
+            self.cpu_query_warm = false;
+            return null;
+        }
+        if (w.PdhCollectQueryData(self.cpu_query) != 0) {
+            self.cpu_query_warm = false;
+            return null;
+        }
+        if (!self.cpu_query_warm) {
+            self.cpu_query_warm = true;
+            return null;
+        }
+        return self.readCpuSpeed();
     }
 
     /// Re-baselines every delta-based reading and marks the paused period as a gap in the charts.
@@ -328,6 +390,7 @@ pub const Collector = struct {
         _ = self.readNetworks(false);
         if (self.query != null) _ = w.PdhCollectQueryData(self.query);
         self.cpu_ghz = null;
+        self.cpu_query_warm = false;
         for (&self.history) |*series| series.push(null);
         for (self.disks.items) |*disk| disk.activity.push(null);
         for (self.networks.items) |*net| {
@@ -343,7 +406,9 @@ pub const Collector = struct {
         }
     }
 
-    pub fn sample(self: *Collector, query_gpu_temp: bool) void {
+    /// `summary_open`: the summary panel is visible (GPU temperature and CPU speed are read only then).
+    pub fn sample(self: *Collector, summary_open: bool) void {
+        const query_gpu_temp = summary_open;
         var skip_pdh_rates = false;
         if (self.pdhMissingCounters()) {
             if (self.pdh_retry_countdown == 0) {
@@ -376,7 +441,7 @@ pub const Collector = struct {
         const collected = !skip_pdh_rates and self.query != null and w.PdhCollectQueryData(self.query) == 0;
         if (collected) self.pdh_samples +|= 1;
 
-        self.cpu_ghz = if (collected) self.readCpuSpeed() else null;
+        self.cpu_ghz = self.sampleCpuSpeed(summary_open);
         self.refreshGpus();
         self.history[@intFromEnum(Kind.gpu)].push(self.readGpu(collected, query_gpu_temp));
         self.history[@intFromEnum(Kind.disk)].push(self.readDisks(collected));
@@ -388,9 +453,9 @@ pub const Collector = struct {
         }
     }
 
-    fn addCounter(self: *Collector, path: [*:0]const u16) w.PDH_HCOUNTER {
+    fn addCounter(_: *Collector, query: w.PDH_HQUERY, path: [*:0]const u16) w.PDH_HCOUNTER {
         var counter: w.PDH_HCOUNTER = null;
-        return if (w.PdhAddEnglishCounterW(self.query, path, 0, &counter) == 0) counter else null;
+        return if (w.PdhAddEnglishCounterW(query, path, 0, &counter) == 0) counter else null;
     }
 
     fn readCpu(self: *Collector) ?f64 {
@@ -407,8 +472,11 @@ pub const Collector = struct {
     fn readCpuSpeed(self: *Collector) ?f64 {
         const frequency = scalar(self.cpu_frequency) orelse return null;
         if (frequency <= 0) return null;
-        const performance = scalar(self.cpu_performance);
-        return if (performance) |pct| frequency * pct / 100_000 else frequency / 1000;
+        // Without the performance counter, fall back to the nominal frequency; with it but no
+        // valid sample yet, show nothing rather than the nominal value for a second.
+        const performance = scalar(self.cpu_performance) orelse
+            return if (self.cpu_performance == null) frequency / 1000 else null;
+        return frequency * performance / 100_000;
     }
 
     fn items(self: *Collector, counter: w.PDH_HCOUNTER) []const w.PDH_FMT_COUNTERVALUE_ITEM_W {
@@ -557,24 +625,16 @@ pub const Collector = struct {
         return peak;
     }
 
-    fn readNetworks(self: *Collector, record: bool) ?f64 {
+    /// Rebuilds the interface list from the full tables (GetIfTable2 + unicast addresses).
+    /// Keeps each surviving interface's history and traffic baseline.
+    fn rebuildNetworks(self: *Collector) bool {
         var result: ?*interfaces.Table = null;
-        if (interfaces.GetIfTable2(&result) != 0 or result == null) {
-            for (self.networks.items) |*net| {
-                net.received.push(null);
-                net.sent.push(null);
-            }
-            return null;
-        }
+        if (interfaces.GetIfTable2(&result) != 0 or result == null) return false;
         const table = result.?;
         defer interfaces.FreeMibTable(table);
         const addresses = interfaces.AddressTable.read();
         defer if (addresses) |entries| interfaces.FreeMibTable(entries);
-        const now = w.GetTickCount64();
         for (self.networks.items) |*net| net.observed = false;
-        var total_all: ?f64 = null;
-        var total_physical: ?f64 = null;
-        var any_physical = false;
         for (table.rows()) |*row| {
             if (!row.active()) continue;
             const key = row.key;
@@ -582,8 +642,6 @@ pub const Collector = struct {
                 if (!entries.contains(key)) continue;
             }
             const physical = row.isPhysical();
-            if (physical) any_physical = true;
-
             const net = for (self.networks.items) |*net| {
                 if (net.key == key) break net;
             } else blk: {
@@ -591,27 +649,11 @@ pub const Collector = struct {
                 net.* = .{ .key = key, .index = row.index, .name = row.alias, .description = row.description, .physical = physical };
                 break :blk net;
             };
-            const prior = net.prior;
             net.observed = true;
             net.index = row.index;
             net.name = row.alias;
             net.description = row.description;
             net.physical = physical;
-            net.prior = .{ .received = row.in_octets, .sent = row.out_octets, .time = now };
-            if (!record) continue;
-            const recv, const sent = if (prior) |p|
-                .{ counterRate(row.in_octets, p.received, now -| p.time), counterRate(row.out_octets, p.sent, now -| p.time) }
-            else
-                .{ @as(?f64, null), @as(?f64, null) };
-            net.received.push(recv);
-            net.sent.push(sent);
-            if (recv != null or sent != null) {
-                const delta = (recv orelse 0) + (sent orelse 0);
-                total_all = (total_all orelse 0) + delta;
-                if (physical) {
-                    total_physical = (total_physical orelse 0) + delta;
-                }
-            }
         }
         var i: usize = self.networks.items.len;
         while (i > 0) {
@@ -623,6 +665,61 @@ pub const Collector = struct {
                 return a.index < b.index;
             }
         }.less);
+        return true;
+    }
+
+    fn readNetworks(self: *Collector, record: bool) ?f64 {
+        // GetIfTable2 builds a row for every interface (virtual ones included) and is one of the
+        // costliest calls per sample: the full list is rebuilt only on a change notification
+        // or every ~60 samples.
+        self.net_list_age +|= 1;
+        if (self.net_dirty.swap(false, .acq_rel) or self.net_list_age >= 60) {
+            self.net_list_age = 0;
+            if (!self.rebuildNetworks()) {
+                self.net_dirty.store(true, .release); // retry on the next sample
+                if (record) for (self.networks.items) |*net| {
+                    net.received.push(null);
+                    net.sent.push(null);
+                };
+                return null;
+            }
+        }
+
+        const now = w.GetTickCount64();
+        var total_all: ?f64 = null;
+        var total_physical: ?f64 = null;
+        var any_physical = false;
+        for (self.networks.items) |*net| {
+            if (net.physical) any_physical = true;
+            var row = std.mem.zeroes(interfaces.Row);
+            row.key = net.key;
+            if (interfaces.GetIfEntry2(&row) != 0 or !row.active()) {
+                // Went down between notifications: a gap now, gone after the next rebuild.
+                self.net_dirty.store(true, .release);
+                net.prior = null;
+                if (record) {
+                    net.received.push(null);
+                    net.sent.push(null);
+                }
+                continue;
+            }
+            const prior = net.prior;
+            net.prior = .{ .received = row.in_octets, .sent = row.out_octets, .time = now };
+            if (!record) continue;
+            const recv, const sent = if (prior) |p|
+                .{ counterRate(row.in_octets, p.received, now -| p.time), counterRate(row.out_octets, p.sent, now -| p.time) }
+            else
+                .{ @as(?f64, null), @as(?f64, null) };
+            net.received.push(recv);
+            net.sent.push(sent);
+            if (recv != null or sent != null) {
+                const delta = (recv orelse 0) + (sent orelse 0);
+                total_all = (total_all orelse 0) + delta;
+                if (net.physical) {
+                    total_physical = (total_physical orelse 0) + delta;
+                }
+            }
+        }
         return selectNetworkTotal(any_physical, total_physical, total_all);
     }
 };

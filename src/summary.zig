@@ -73,6 +73,8 @@ pub const Panel = struct {
         if (self.window != null and w.IsWindow(self.window) != 0) {
             _ = w.ShowWindow(self.window, w.SW_HIDE);
         }
+        // Back buffer and fonts are released while hidden and rebuilt on the next draw.
+        self.deinit();
     }
 
     pub fn position(self: *Panel, bar: taskbar.Bar, rows: usize) bool {

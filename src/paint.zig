@@ -247,23 +247,25 @@ pub fn plot(dc: w.HDC, rect: w.RECT, color: w.COLORREF, series: *const metrics.S
     const width = rect.right - rect.left - 1;
     const height = rect.bottom - rect.top - 1;
     const safe_scale = if (scale > 0) scale else 100.0;
-    var previous = false;
+    // One Polyline per run of known values instead of a LineTo call per point.
+    // Same pixels: Polyline, like LineTo, leaves out the last point, which SetPixelV fills in.
+    var points: [metrics.capacity]w.POINT = undefined;
+    var run: usize = 0;
     for (0..series.count) |index| {
         const value = series.at(index) orelse {
-            previous = false;
+            if (run >= 2) _ = w.Polyline(dc, &points, @intCast(run));
+            run = 0;
             continue;
         };
         const column: i32 = @intCast(metrics.capacity - series.count + index);
         const x = rect.left + @divTrunc(column * width, metrics.capacity - 1);
         const norm = std.math.clamp(value / safe_scale, 0.0, 1.0);
         const y = rect.bottom - 1 - @as(i32, @intFromFloat(@round(norm * @as(f64, @floatFromInt(height)))));
-        if (previous) _ = w.LineTo(dc, x, y) else _ = w.MoveToEx(dc, x, y, null);
-        previous = true;
+        points[run] = .{ .x = x, .y = y };
+        run += 1;
     }
-    if (previous) {
-        var end: w.POINT = undefined;
-        if (w.GetCurrentPositionEx(dc, &end) != 0) _ = w.SetPixelV(dc, end.x, end.y, color);
-    }
+    if (run >= 2) _ = w.Polyline(dc, &points, @intCast(run));
+    if (run > 0) _ = w.SetPixelV(dc, points[run - 1].x, points[run - 1].y, color);
 }
 
 pub fn fill(dc: w.HDC, rect: w.RECT, color: w.COLORREF) void {
