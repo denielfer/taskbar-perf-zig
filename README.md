@@ -2,7 +2,7 @@
 
 Minigráficos de CPU, RAM, GPU, disco e rede sobre a barra de tarefas principal do Windows. Abra `zig-out\bin\TaskbarPerfZig.exe`.
 
-> **Outra versão:** existe uma implementação independente da mesma ideia em C++20 com Win32 e Direct2D, no repositório **`taskbar-perf`** (*TaskbarPerf*). Ela fica perto do relógio por padrão e tem menu para escolher métricas, monitor e posição, além de iniciar com o Windows. As duas não compartilham código nem configuração.
+> **Outra versão:** existe uma implementação independente da mesma ideia em C++20 com Win32 e Direct2D, no repositório [**`taskbar-perf`**](https://github.com/denielfer/taskbar-perf) (*TaskbarPerf*). Ela fica perto do relógio por padrão e tem menu para escolher métricas, monitor e posição, além de iniciar com o Windows. As duas não compartilham código nem configuração.
 
 O programa acompanha a barra via `SetWinEventHook` e timer adaptativo, mede o espaço livre entre os botões na metade esquerda por UI Automation e se oculta quando nenhum bloco cabe ou quando um aplicativo em tela cheia ocupa o mesmo monitor. Coleta e desenho também pausam quando a tela desliga ou a sessão é bloqueada.
 
