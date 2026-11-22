@@ -297,7 +297,9 @@ fn track(window: w.HWND) void {
         stable_bar_ticks += 1;
         setTrackTimer(window, 16);
     } else {
-        setTrackTimer(window, 500);
+        // Idle safety net only: the Explorer location hook, foreground events and the
+        // tracker already trigger track() on real changes (no idle tick changed anything).
+        setTrackTimer(window, 2000);
     }
 
     if (!(panel.bounds != null and w.GetForegroundWindow() == panel.window) and

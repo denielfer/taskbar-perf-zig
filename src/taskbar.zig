@@ -190,6 +190,12 @@ const UiaResources = struct {
     }
 };
 
+/// Safety-net UIA scan of the taskbar buttons. Each scan walks Explorer's accessibility tree,
+/// so it costs CPU in Explorer too; layout changes, the Explorer location hook (300 ms) and
+/// foreground changes (1.5 s) already trigger their own scans, so this only catches silent
+/// button changes.
+const periodic_measure_ms: u64 = 60_000;
+
 pub const Tracker = struct {
     mutex: std.Thread.Mutex = .{},
     stop: std.atomic.Value(bool) = .init(false),
@@ -208,7 +214,8 @@ pub const Tracker = struct {
     pub fn start(self: *Tracker, max_tiles: usize, notify_window: w.HWND, notify_message: w.UINT) !void {
         self.notify_window = notify_window;
         self.notify_message = notify_message;
-        self.thread = try std.Thread.spawn(.{}, watch, .{ self, max_tiles });
+        // std.Thread.spawn on Windows commits the whole stack (16 MiB by default); UIA/COM fits in 512 KiB.
+        self.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, watch, .{ self, max_tiles });
     }
 
     pub fn deinit(self: *Tracker) void {
@@ -310,7 +317,7 @@ pub const Tracker = struct {
                     const layout_req = self.layout_requested.load(.acquire);
                     const fg_req = self.foreground_requested.load(.acquire);
                     const should_measure = layout_changed or
-                        since_refresh >= 5000 or
+                        since_refresh >= periodic_measure_ms or
                         (layout_req and since_refresh >= 300) or
                         (fg_req and since_refresh >= 1500);
 
@@ -340,7 +347,7 @@ pub const Tracker = struct {
                     } else if (fg_req) {
                         wait_ms = 1500 -| since_refresh;
                     } else {
-                        wait_ms = 5000 -| since_refresh;
+                        wait_ms = periodic_measure_ms -| since_refresh;
                     }
                 }
             }

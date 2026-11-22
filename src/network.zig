@@ -135,6 +135,35 @@ pub const AddressTable = extern struct {
 pub extern "iphlpapi" fn GetIfTable2(table: *?*Table) callconv(.winapi) w.DWORD;
 pub extern "iphlpapi" fn FreeMibTable(table: *anyopaque) callconv(.winapi) void;
 extern "iphlpapi" fn GetUnicastIpAddressTable(family: u16, table: *?*AddressTable) callconv(.winapi) w.DWORD;
+/// Reads one interface by `row.key` (InterfaceLuid): far cheaper than GetIfTable2 every second.
+pub extern "iphlpapi" fn GetIfEntry2(row: *Row) callconv(.winapi) w.DWORD;
+
+/// Shared shape of the interface and unicast-address change callbacks (row/type unused).
+pub const ChangeCallback = *const fn (context: ?*anyopaque, row: ?*anyopaque, kind: u32) callconv(.winapi) void;
+extern "iphlpapi" fn NotifyIpInterfaceChange(family: u16, callback: ChangeCallback, context: ?*anyopaque, initial: u8, handle: *?*anyopaque) callconv(.winapi) w.DWORD;
+extern "iphlpapi" fn NotifyUnicastIpAddressChange(family: u16, callback: ChangeCallback, context: ?*anyopaque, initial: u8, handle: *?*anyopaque) callconv(.winapi) w.DWORD;
+extern "iphlpapi" fn CancelMibChangeNotify2(handle: ?*anyopaque) callconv(.winapi) w.DWORD;
+
+/// Raises `flag` whenever an interface or unicast address changes (callbacks run on a
+/// system pool thread). Cancel with `unwatchChanges` before `flag` goes away.
+pub fn watchChanges(flag: *std.atomic.Value(bool), handles: *[2]?*anyopaque) void {
+    const callback: ChangeCallback = struct {
+        fn changed(context: ?*anyopaque, _: ?*anyopaque, _: u32) callconv(.winapi) void {
+            const target: *std.atomic.Value(bool) = @ptrCast(@alignCast(context orelse return));
+            target.store(true, .release);
+        }
+    }.changed;
+    if (handles[0] == null and NotifyIpInterfaceChange(0, callback, flag, 0, &handles[0]) != 0) handles[0] = null;
+    if (handles[1] == null and NotifyUnicastIpAddressChange(0, callback, flag, 0, &handles[1]) != 0) handles[1] = null;
+}
+
+/// Waits for an in-flight callback to finish, so the flag may be freed afterwards.
+pub fn unwatchChanges(handles: *[2]?*anyopaque) void {
+    for (handles) |*handle| {
+        if (handle.*) |h| _ = CancelMibChangeNotify2(h);
+        handle.* = null;
+    }
+}
 
 fn writeWide(buf: *[257]u16, text: []const u8) void {
     @memset(buf, 0);
